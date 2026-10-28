@@ -24,6 +24,8 @@ class Goal:
     budget: int | None = None
     spent: int = 0
     resolves: str | None = None
+    durable: bool = False
+    done: bool = False          # a delta for this goal was integrated
 
 
 @dataclass
@@ -35,6 +37,7 @@ class Session:
     checkpoint: str | None = None
     observed: dict = field(default_factory=dict)  # peer session -> [trees seen]
     started_l: int = 0
+    notes: list = field(default_factory=list)     # [(kind, data)] from the adapter
 
 
 @dataclass
@@ -50,6 +53,7 @@ class Delta:
     reason: str = ""
     flags: list = field(default_factory=list)  # [(reason, dep_session)]
     annotations: dict = field(default_factory=dict)  # by -> intent
+    partial: bool = False             # useful part of the goal; the goal stays open
 
 
 @dataclass
@@ -84,13 +88,15 @@ class State:
     def _goal_open(self, d, ev):
         self._need(d["goal"] not in self.goals, "duplicate goal")
         self._need(d["parent"] is None or d["parent"] in self.goals, "unknown parent goal")
+        self._need(d.get("resolves") is None or d["resolves"] in self.deltas, "unknown resolved delta")
         self.goals[d["goal"]] = Goal(d["goal"], d["text"], d["parent"], d.get("privileged", False),
-                                     d.get("budget"), 0, d.get("resolves"))
+                                     d.get("budget"), 0, d.get("resolves"), d.get("durable", False))
 
     def _session_start(self, d, ev):
         self._need(d["session"] not in self.sessions, "duplicate session")
         g = self.goals.get(d["goal"])
         self._need(g is not None, "unknown goal")
+        self._need(not g.durable, "durable goals are worked on through their children")
         self._need(d["base"] == self.head, "session must start from current head")
         self._need(g.budget is None or g.spent < g.budget, "goal budget exhausted")
         g.spent += 1
@@ -113,11 +119,16 @@ class State:
         s = self._active(d["session"])
         s.status = "proposed"
         self.deltas[s.id] = Delta(s.id, "agent", s.goal, s.base, d["result"], d.get("intent", ""),
-                                  sorted(s.observed))
+                                  sorted(s.observed), partial=bool(d.get("partial", False)))
         self.queue.append(s.id)
 
     def _session_lost(self, d, ev):
         self._active(d["session"]).status = "lost"
+
+    def _session_note(self, d, ev):
+        s = self.sessions.get(d["session"])
+        self._need(s is not None, "note on unknown session")
+        s.notes.append((d["what"], d["data"]))
 
     def _external(self, d, ev):
         self._need(d["delta"] not in self.deltas, "duplicate delta")
@@ -143,6 +154,12 @@ class State:
         self.queue.remove(x.id)
         self.head = d["to"]
         self.heads.append((ev["seq"], d["to"], x.id))
+        g = self.goals.get(x.goal) if x.goal and not x.partial else None
+        while g is not None and not g.durable:
+            g.done = True
+            # resolving a conflict finishes the goal the conflicted delta served
+            r = self.deltas.get(g.resolves) if g.resolves else None
+            g = self.goals.get(r.goal) if r and r.goal else None
 
     def _reject(self, d, ev):
         x = self._queued(d["delta"])

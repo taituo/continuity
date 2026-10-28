@@ -306,7 +306,10 @@ def check(w: World) -> dict:
             dd = st.deltas.get(dep)
             bad = "dependency_lost" if ds == "lost" else (
                 f"dependency_{dd.status}" if dd and dd.status in ("rejected", "conflict") else None)
-            if bad:
+            # continuing your own goal, or the delta you exist to resolve, is expected
+            expected = (st.sessions[dep].goal == x.goal
+                        or (x.goal is not None and st.goals[x.goal].resolves == dep))
+            if bad and not expected:
                 assert (bad, dep) in x.flags, f"{x.id} missing flag {bad} for {dep}"
     # I10: provenance. Every token in any head comes from an integrated delta,
     #      or from work some integrated delta was recorded as observing.

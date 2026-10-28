@@ -129,7 +129,8 @@ class Scenarios(unittest.TestCase):
         self.assertEqual(x.origin, "external")
 
     def test_observation_creates_flag_when_dependency_fails(self):
-        a, b = self.o.start_session(self.g), self.o.start_session(self.g)
+        other = self.o.open_goal("document add")
+        a, b = self.o.start_session(self.g), self.o.start_session(other)
         self.edit(a, "return a * b", "return a ** b")      # will fail tests
         self.o.checkpoint(a)
         view = self.o.peek(b, a)
@@ -173,6 +174,20 @@ class Scenarios(unittest.TestCase):
         out = [(r["outcome"], r.get("reason")) for r in self.o.run_queue()]
         self.assertEqual(out, [("integrated", None), ("rejected", "eval_failed")])
         self.assertNotIn("geometry.py", self.o.store.tree(self.o.state.head))
+
+    def test_same_goal_dependency_is_expected_not_flagged(self):
+        """A later attempt reading an earlier attempt at the same goal is the
+        designed continuation path, so it is recorded but not flagged."""
+        a, b = self.o.start_session(self.g), self.o.start_session(self.g)
+        self.edit(a, "return a * b", "return a ** b")
+        self.o.checkpoint(a)
+        self.o.peek(b, a)
+        self.o.lose(a)
+        self.edit(b, "def add(a, b):", "def add(a, b):  # continued")
+        self.o.propose(b)
+        self.assertEqual(self.o.run_queue()[-1]["outcome"], "integrated")
+        self.assertEqual(self.o.state.deltas[b].observed, [a])
+        self.assertEqual(self.o.state.deltas[b].flags, [])
 
     def test_restart_mid_session_resumes(self):
         s = self.o.start_session(self.g)

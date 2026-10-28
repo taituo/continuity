@@ -6,12 +6,23 @@ name and any copy (a worktree, a peer view) is just a re-materialisation.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
 
 EMPTY_TREE_BYTES = b"{}"
+
+# Build and tool droppings that must never become part of a delta: an agent
+# running the tests in its worktree would otherwise commit __pycache__.
+DEFAULT_IGNORE = ("__pycache__", "*.pyc", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                  ".git", ".hg", ".DS_Store", "node_modules")
+
+
+def ignored(rel: str, patterns=DEFAULT_IGNORE) -> bool:
+    """True if any component of the relative path matches an ignore pattern."""
+    return any(fnmatch.fnmatchcase(part, pat) for part in rel.split("/") for pat in patterns)
 
 
 def sha(data: bytes) -> str:
@@ -76,10 +87,19 @@ class Store:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(self.get(b))
 
-    def snapshot(self, src: Path) -> str:
+    def snapshot(self, src: Path, ignore=DEFAULT_IGNORE) -> str:
+        """Tree of every regular file under src. Symlinks are not followed,
+        so a link pointing outside the worktree cannot smuggle content in."""
         src = Path(src)
         files = {}
-        for f in sorted(src.rglob("*")):
-            if f.is_file():
-                files[f.relative_to(src).as_posix()] = f.read_bytes()
+        for dirpath, dirnames, filenames in os.walk(src):
+            rel_dir = Path(dirpath).relative_to(src).as_posix()
+            dirnames[:] = sorted(d for d in dirnames
+                                 if not ignored(d if rel_dir == "." else f"{rel_dir}/{d}", ignore))
+            for name in sorted(filenames):
+                rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+                f = Path(dirpath) / name
+                if ignored(rel, ignore) or f.is_symlink() or not f.is_file():
+                    continue
+                files[rel] = f.read_bytes()
         return self.tree_from_files(files)

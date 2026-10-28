@@ -22,22 +22,25 @@ from .hlc import HLC
 from .log import Log
 from .merge import changed_paths, merge_trees
 from .state import State, fold
-from .store import Store
+from .store import DEFAULT_IGNORE, Store, ignored
 
 
 class Evaluator(Protocol):
     def __call__(self, files: dict[str, bytes]) -> tuple[bool, str]: ...
 
 
-def sync_dir(store: Store, tree: str, dest: Path) -> None:
-    """Make dest contain exactly `tree` (only touches what differs)."""
+def sync_dir(store: Store, tree: str, dest: Path, ignore=DEFAULT_IGNORE) -> None:
+    """Make dest contain exactly `tree` (only touches what differs; leaves
+    ignored droppings such as __pycache__ alone)."""
     dest.mkdir(parents=True, exist_ok=True)
     want = store.tree(tree)
     for f in sorted(dest.rglob("*"), reverse=True):
         rel = f.relative_to(dest).as_posix()
-        if f.is_file() and rel not in want:
+        if ignored(rel, ignore):
+            continue
+        if (f.is_file() or f.is_symlink()) and rel not in want:
             f.unlink()
-        elif f.is_dir() and not any(f.iterdir()):
+        elif f.is_dir() and not f.is_symlink() and not any(f.iterdir()):
             f.rmdir()
     for p, b in want.items():
         f = dest / p
@@ -50,8 +53,13 @@ def sync_dir(store: Store, tree: str, dest: Path) -> None:
 class Orchestrator:
     def __init__(self, root: Path, evaluator: Evaluator, protected: tuple[str, ...] = (),
                  physical: Callable[[], int] | None = None, lease_us: int = 3_600_000_000,
-                 fsync: bool = True, merge_algo: str = "myers"):
+                 fsync: bool = True, merge_algo: str = "myers", ignore=DEFAULT_IGNORE,
+                 supersede_done: bool = False):
+        """supersede_done: reject a delta whose goal is already done (another
+        attempt or variant got there first) instead of merging it as well."""
         self.root = Path(root)
+        self.supersede_done = supersede_done
+        self.ignore = tuple(ignore)
         self.store = Store(self.root / ".continuity")
         self.log = Log(self.root / ".continuity" / "log.jsonl", fsync=fsync)
         self.state: State = fold(self.log.events, self.store.EMPTY)
@@ -63,37 +71,63 @@ class Orchestrator:
         self.merge_algo = merge_algo
         self.main = self.root / "main"
         if not self.main.exists():
-            sync_dir(self.store, self.state.head, self.main)
+            sync_dir(self.store, self.state.head, self.main, self.ignore)
+
+    def snapshot(self, path: Path) -> str:
+        return self.store.snapshot(path, self.ignore)
 
     # ------------------------------------------------------------------
     def _emit(self, kind: str, **data) -> dict:
         # Validate by applying first: an invalid transition raises before
         # anything reaches disk, so the log only ever holds legal history.
         # (Every State handler checks before it mutates.)
-        ev = self.log.prepare(kind, data, self.clock.now())
-        self.state.apply(ev)
-        return self.log.commit(ev)
+        with self.log.locked():
+            self._catch_up()
+            ev = self.log.prepare(kind, data, self.clock.now())
+            self.state.apply(ev)
+            return self.log.commit(ev)
+
+    def _catch_up(self) -> list[dict]:
+        new = self.log.sync()
+        for ev in new:
+            self.state.apply(ev)
+        if new:
+            self.clock.recv(tuple(new[-1]["hlc"]))
+        return new
+
+    def refresh(self) -> list[dict]:
+        """Apply events other processes appended (e.g. `continuity goal` from a
+        shell while a runner runs)."""
+        with self.log.locked():
+            return self._catch_up()
 
     def _new_id(self, prefix: str) -> str:
         return f"{prefix}{self.state.counter}"
 
     # -- goals ---------------------------------------------------------
     def open_goal(self, text: str, parent: str | None = None, privileged: bool = False,
-                  budget: int | None = None, resolves: str | None = None) -> str:
+                  budget: int | None = None, resolves: str | None = None,
+                  durable: bool = False) -> str:
+        """durable: a long-lived container goal (maintain a service, keep
+        improving X). It is never 'done' and is not worked on directly; its
+        children are."""
         gid = self._new_id("g")
-        self._emit("goal.open", goal=gid, parent=parent, text=text, privileged=privileged,
-                   budget=budget, resolves=resolves)
+        data = dict(goal=gid, parent=parent, text=text, privileged=privileged,
+                    budget=budget, resolves=resolves)
+        if durable:
+            data["durable"] = True
+        self._emit("goal.open", **data)
         return gid
 
     # -- drift ---------------------------------------------------------
     def check_drift(self) -> str | None:
         """Anything in main/ that head does not explain is an external delta."""
-        snap = self.store.snapshot(self.main)
+        snap = self.snapshot(self.main)
         if snap == self.state.head:
             return None
         did = self._new_id("x")
         self._emit("external", delta=did, base=self.state.head, result=snap)
-        sync_dir(self.store, self.state.head, self.main)  # main/ mirrors head again
+        sync_dir(self.store, self.state.head, self.main, self.ignore)  # main/ mirrors head again
         return did
 
     # -- sessions ------------------------------------------------------
@@ -109,17 +143,48 @@ class Orchestrator:
 
     def checkpoint(self, sid: str) -> str:
         s = self.state.sessions[sid]
-        tree = self.store.snapshot(self.workdir(sid))
+        tree = self.snapshot(self.workdir(sid))
         if tree != (s.checkpoint or s.base):
             self._emit("session.checkpoint", session=sid, tree=tree)
         return tree
 
+    def visible_tree(self, peer: str) -> str:
+        """What other sessions get to see of `peer`: its latest checkpoint,
+        or its proposal once proposed."""
+        p = self.state.sessions[peer]
+        if p.status == "proposed":
+            return self.state.deltas[peer].result
+        return p.checkpoint or p.base
+
+    def observe(self, sid: str, peer: str, tree: str, via: str = "peek") -> bool:
+        """Record that `sid` looked at `peer`'s work as of `tree`. Idempotent."""
+        s = self.state.sessions.get(sid)
+        if s is None or s.status != "active" or peer == sid or peer not in self.state.sessions:
+            return False
+        if tree in s.observed.get(peer, []):
+            return False
+        self._emit("session.observe", session=sid, peer=peer, tree=tree, via=via)
+        return True
+
+    def note(self, sid: str, kind: str, data: dict) -> None:
+        """Adapter-level facts about a session (stop reason, denials, usage)."""
+        self._emit("session.note", session=sid, what=kind, data=data)
+
+    def orphan_active(self, why: str = "orphaned") -> list[str]:
+        """Agent processes do not survive their runner. After a restart every
+        session still active in the log is dead: record that, keep its last
+        checkpoint in the log for the next attempt."""
+        dead = sorted(x for x, s in self.state.sessions.items() if s.status == "active")
+        for x in dead:
+            if self.workdir(x).exists():
+                self.checkpoint(x)      # keep whatever it wrote after its last checkpoint
+            self.note(x, "orphaned", {"why": why})
+            self.lose(x)
+        return dead
+
     def peek(self, sid: str, peer: str) -> Path:
         """Read-only copy of a peer's latest checkpoint; the look is logged."""
-        p = self.state.sessions[peer]
-        tree = p.checkpoint or p.base
-        if p.status == "proposed":
-            tree = self.state.deltas[peer].result
+        tree = self.visible_tree(peer)
         self._emit("session.observe", session=sid, peer=peer, tree=tree)
         view = self.root / "views" / sid / peer
         if view.exists():
@@ -134,9 +199,14 @@ class Orchestrator:
                 if x != sid and s.status in ("active", "proposed")
                 and (s.checkpoint or s.status == "proposed")]
 
-    def propose(self, sid: str, intent: str = "") -> str:
-        result = self.store.snapshot(self.workdir(sid))
-        self._emit("session.propose", session=sid, result=result, intent=intent)
+    def propose(self, sid: str, intent: str = "", partial: bool = False) -> str:
+        """partial: the delta is a useful piece; once integrated the goal stays
+        open and the next session continues from it."""
+        result = self.snapshot(self.workdir(sid))
+        data = dict(session=sid, result=result, intent=intent)
+        if partial:
+            data["partial"] = True
+        self._emit("session.propose", **data)
         self._dispose(sid)
         return sid
 
@@ -165,9 +235,20 @@ class Orchestrator:
         self._emit("annotate", delta=delta, by=by, intent=intent)
 
     # -- integration ---------------------------------------------------
+    def expected_dependency(self, x, dep: str) -> bool:
+        """Building on an earlier attempt at the same goal, or on the delta a
+        resolution goal exists to resolve, is the designed path, not a risk."""
+        st = self.state
+        if x.goal is None or dep not in st.sessions:
+            return False
+        if st.sessions[dep].goal == x.goal:
+            return True
+        return st.goals[x.goal].resolves == dep
+
     def _flag_dependents(self, dep: str, reason: str) -> None:
         for x in sorted(self.state.deltas.values(), key=lambda d: d.id):
-            if dep in x.observed and x.status == "integrated" and (reason, dep) not in x.flags:
+            if (dep in x.observed and x.status == "integrated" and (reason, dep) not in x.flags
+                    and not self.expected_dependency(x, dep)):
                 self._emit("flag", delta=x.id, reason=reason, dep=dep)
 
     def _blocked(self, x) -> list[str]:
@@ -206,9 +287,12 @@ class Orchestrator:
                 reason = "dependency_lost"
             elif dd and dd.status in ("rejected", "conflict"):
                 reason = f"dependency_{dd.status}"
-            if reason and (reason, dep) not in x.flags:
+            if reason and (reason, dep) not in x.flags and not self.expected_dependency(x, dep):
                 self._emit("flag", delta=x.id, reason=reason, dep=dep)
 
+        if (self.supersede_done and x.goal is not None and st.goals[x.goal].done
+                and not st.goals[x.goal].durable):
+            return self._decide_reject(x, "superseded")
         if x.result == x.base:
             return self._decide_reject(x, "empty")
         bad = self._touches_protected(x)
@@ -237,7 +321,7 @@ class Orchestrator:
         if self.check_drift() is not None or st.head != head:
             return {"delta": x.id, "outcome": "retry"}
         self._emit("integrate", delta=x.id, **{"from": head, "to": cand})
-        sync_dir(self.store, cand, self.main)
+        sync_dir(self.store, cand, self.main, self.ignore)
         return {"delta": x.id, "outcome": "integrated"}
 
     def _decide_reject(self, x, reason):

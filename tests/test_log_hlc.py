@@ -40,6 +40,34 @@ class Tamper(unittest.TestCase):
             with self.assertRaises(ChainError):
                 verify_chain(evs)
 
+    def test_unterminated_last_line_is_torn_even_if_it_parses(self):
+        d, log = build(3)
+        with open(d / "log.jsonl", "ab") as f:
+            f.write(canon({"seq": 3}))              # complete JSON, no newline: still torn
+        again = Log(d / "log.jsonl", fsync=False)
+        self.assertEqual(len(again.events), 3)
+        again.append("goal.open", {"goal": "gx", "parent": None, "text": "x"}, (2000, 0))
+        verify_chain(Log(d / "log.jsonl", fsync=False).events)
+
+    def test_corrupt_complete_line_is_an_error_not_a_truncation(self):
+        d, log = build(5)
+        lines = (d / "log.jsonl").read_bytes().split(b"\n")
+        lines[2] = b"{not json"
+        (d / "log.jsonl").write_bytes(b"\n".join(lines))
+        with self.assertRaises(ChainError):
+            Log(d / "log.jsonl", fsync=False)
+
+    def test_two_writers_never_fork_the_chain(self):
+        d, _ = build(0)
+        a, b = Log(d / "log.jsonl", fsync=False), Log(d / "log.jsonl", fsync=False)
+        t = 1000
+        for k in range(50):
+            t += 1
+            (a if k % 3 else b).append("goal.open", {"goal": f"g{k}", "parent": None, "text": ""}, (t, 0))
+        merged = Log(d / "log.jsonl", fsync=False).events
+        self.assertEqual(len(merged), 50)
+        verify_chain(merged)
+
     def test_truncation_needs_anchor(self):
         _, log = build()
         anchor = log.head_id
